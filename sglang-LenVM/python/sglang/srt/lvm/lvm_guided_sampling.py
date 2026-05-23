@@ -771,12 +771,24 @@ class PendingLvmResult:
 
 
 class LvmGuidedSampler:
+    # ABLATION (plan §0 #1 — not for production): when LENVM_STRIDE > 1,
+    # only invoke the LVM apply() path once every N decode steps per request.
+    # The skipped steps fall back to vanilla top-k sampling (no LVM tilt).
+    _lvm_stride: int = max(1, int(os.environ.get("LENVM_STRIDE", "1")))
+
     def __init__(self, config: LvmGuidedConfig, *, model_runner=None):
         self.config = config
         self._session = requests.Session()
         self._fn = _load_guidance_fn(config.fn_spec)
         self._decode_model_runner = model_runner
         self._inproc = None
+        if self._lvm_stride > 1:
+            logger.warning(
+                "LvmGuidedSampler: LENVM_STRIDE=%d (ABLATION mode — LVM apply runs "
+                "1 of every %d steps; skipped steps use vanilla top-k sampling). "
+                "This violates plan §0 #1 and must not ship.",
+                self._lvm_stride, self._lvm_stride,
+            )
 
     @staticmethod
     def from_server_args(server_args, model_runner=None) -> Optional["LvmGuidedSampler"]:
@@ -1336,10 +1348,25 @@ class LvmGuidedSampler:
         # Identify guided rows and whether any request wants hard-target decoding.
         # Per-req result is cached on the Req object so this is O(1) per step
         # after the first call.
+        #
+        # ABLATION (plan §0 #1): when LENVM_STRIDE > 1, only every Nth call per
+        # request actually enters the guided set. The skipped requests fall back
+        # to vanilla top-k sampling on this step. Counter is per-req so different
+        # batches stay in sync with their own decode positions.
+        stride = self._lvm_stride
         guided_rows: List[int] = []
         has_hard_target = False
         for i, req in enumerate(req_list):
             if self._req_wants_value_guidance(req):
+                if stride > 1:
+                    step_ct = getattr(req, "_lvm_stride_counter", 0)
+                    should_run = (step_ct % stride) == 0
+                    try:
+                        setattr(req, "_lvm_stride_counter", step_ct + 1)
+                    except Exception:
+                        pass
+                    if not should_run:
+                        continue
                 guided_rows.append(i)
                 if self._req_has_hard_target(req):
                     has_hard_target = True
