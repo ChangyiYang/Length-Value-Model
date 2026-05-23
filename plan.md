@@ -154,6 +154,18 @@ ssh changyi@liquid-gpu-055 'cd Length-Value-Model && \
 
 `inference/tradeoff/sample_eval.py` does not forward `seed` to the SGLang server, so the §1 **strict bitwise** gate cannot run yet — pass@k stability is the only available gate for this PR. Threading `seed` through `sample_eval` (and through `run_timing`) is a separate small PR; track it in `out-of-scope` below if it's not started before the next perf change.
 
+### Post-patch profiler verdict (2026-05-23, single-trace)
+
+Drove `llm-torch-profiler-analysis` against the patched server (commit `b6198eb`) with a **LenVM-active workload** (sample_eval `value_scale=0` / `value_mode=centered_exp`, 10Q × n=8 GSM8K). Trace at `cache/profile_lenvm_b6198eb/1779567996.9350457-TP-0.trace.json.gz`. Driver script: `scripts/_run_profile_build_pending.sh`.
+
+**Kernel-table headline**: nvjet GEMM family ~65% (mostly `_forward_raw`), FlashAttention SM90 ~10%, FusedAddRMSNorm 3.1%, SwiGLU `act_and_mul` 2.2%. The only `_build_pending`-source kernel above 1% is `radixFindKthValues` (top-k) at 0.52 ms / 5 steps ≈ 0.1 ms / step. **Conclusion: post-patch `_build_pending` has no remaining GPU hotspot**; the 8.35 ms/step we still measure is CPU + sync work (per-request Python loop gathering `prefix_ids_send`, plus a few unavoidable `.tolist()`s). Further P0-3 trimming is diminishing returns.
+
+**Overlap-table headline**: single-trace mode couldn't attribute overlap (skill noted "Use mapping/formal mode"). A two-trace run (graph-off mapping vs graph-on formal) is the right shape for **P0-2 stream overlap** evidence; this is the next experiment.
+
+**Largest remaining wall-clock opportunity (= P0-2)**: `t_lvm_forward_ms` is 32 ms/step wall-clock, but no individually-LenVM-tagged kernel crosses 2% of GPU time. Allowing for shared `_forward_raw` site share, actual qwen2_lvm GPU compute is on the order of 1-2 ms/step. The ~30× gap between wall-clock and GPU time is stream-sync stall — exactly what `--disable-overlap-schedule` blocks. P0-2 should target this.
+
+**Out-of-band finding (out-of-scope here)**: fuse-table top row is PR #22392 (CUTLASS FP8 scaled MM replacing nvjet) at 64.8% related GPU time. Applying to the **base** model would shrink the dominant kernel band. Applying to the **value head** is forbidden by §0 #5 (no FP8 on value head). Tracked as a base-model-side perf option, not part of this perf plan.
+
 ## Out-of-scope (queue, not in this PR)
 
 - Plumb `seed` from `sample_eval.py` → OpenAI-compatible chat completion `seed` param so the §1 bitwise/near-bitwise diff is actually runnable. Required before any PR that touches GPU reduction order.
