@@ -127,12 +127,14 @@ The script chains three stages:
 - Single-rank only. For TP/DP > 1 the timer writes from one rank; extend the
   log filename with the rank suffix if you need per-worker traces.
 - LenVM-extra FLOPs assume **independent single-token forwards** for each of
-  the `k` candidates per generated token. This matches the current
-  sglang-LenVM in-proc path (`tree_value_extend` extends KV once, then
-  each candidate is a separate single-token forward attending to the shared
-  prefix cache). If a future implementation batches all `k` candidates into
-  one forward and amortizes some MLP/attention cost, pass
-  `candidate_cost_multiplier < 1.0` to `lvm_extra_flops` to scale that term.
+  the `k` candidates per generated token. The current in-proc path actually
+  bundles all `k * B` candidate tokens across the batch into one
+  `ForwardBatch` (`eval_candidates_batch_gpu` in
+  `sglang/srt/lvm/lvm_inproc_runner.py`) with a tree-attention custom mask.
+  Theoretical FLOPs are unchanged (each candidate token still does the same
+  arithmetic), but wall-clock GEMM utilisation is much better than `k`
+  separate forwards would imply. Pass `candidate_cost_multiplier < 1.0` to
+  `lvm_extra_flops` if you also want to model amortised MLP/attention cost.
 - LenVM head cost uses the small `MLP2SiLUValueHead` (`d*d + d*out_dim`) not
   the base model's `lm_head` (`d * vocab_size`). `ModelConfig.load(...)`
   auto-detects this by checking for `value_head.safetensors` next to

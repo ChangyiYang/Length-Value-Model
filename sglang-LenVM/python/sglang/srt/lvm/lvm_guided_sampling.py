@@ -1153,9 +1153,16 @@ class LvmGuidedSampler:
         We gate tree_value calls on this to avoid unnecessary network overhead when
         the user did not request value guidance (default scale/mode).
         """
+        cached = getattr(req, "_lvm_wants_guidance", None)
+        if cached is not None:
+            return bool(cached)
         sampling_params = getattr(req, "sampling_params", None)
         custom_params = getattr(sampling_params, "custom_params", None)
         if not isinstance(custom_params, dict):
+            try:
+                setattr(req, "_lvm_wants_guidance", False)
+            except Exception:
+                pass
             return False
         keys = (
             "value_scale",
@@ -1170,7 +1177,37 @@ class LvmGuidedSampler:
             "cmp",
             "op",
         )
-        return any(k in custom_params for k in keys)
+        result = any(k in custom_params for k in keys)
+        try:
+            setattr(req, "_lvm_wants_guidance", result)
+        except Exception:
+            pass
+        return result
+
+    @staticmethod
+    def _req_has_hard_target(req: Any) -> bool:
+        """True iff the request supplies target_value or target_length.
+
+        Cached on the req so the per-step "any hard target?" scan over the batch
+        avoids re-parsing custom_params every decoding step.
+        """
+        cached = getattr(req, "_lvm_has_hard_target", None)
+        if cached is not None:
+            return bool(cached)
+        sampling_params = getattr(req, "sampling_params", None)
+        custom_params = getattr(sampling_params, "custom_params", None)
+        if not isinstance(custom_params, dict):
+            try:
+                setattr(req, "_lvm_has_hard_target", False)
+            except Exception:
+                pass
+            return False
+        result = ("target_value" in custom_params) or ("target_length" in custom_params)
+        try:
+            setattr(req, "_lvm_has_hard_target", result)
+        except Exception:
+            pass
+        return result
 
     @staticmethod
     def _extract_entropy_threshold(req: Any) -> Optional[float]:
@@ -1296,11 +1333,16 @@ class LvmGuidedSampler:
         # `reqs` is typically already a list, but may be any iterable.
         req_list = reqs if isinstance(reqs, list) else list(reqs)
 
-        # Identify which rows actually want value guidance.
+        # Identify guided rows and whether any request wants hard-target decoding.
+        # Per-req result is cached on the Req object so this is O(1) per step
+        # after the first call.
         guided_rows: List[int] = []
+        has_hard_target = False
         for i, req in enumerate(req_list):
             if self._req_wants_value_guidance(req):
                 guided_rows.append(i)
+                if self._req_has_hard_target(req):
+                    has_hard_target = True
 
         # If nobody requested value guidance, do nothing and let normal sampling proceed.
         if not guided_rows:
@@ -1317,37 +1359,40 @@ class LvmGuidedSampler:
         candidate_ids_send: List[List[int]] = []
         send_batch_indices: List[int] = []
         candidate_probs_send: List[List[float]] = []
-        deterministic_rows: List[tuple[int, int]] = []
+        deterministic_rows_idx: List[int] = []
+        deterministic_rows_tok: List[int] = []
 
         # Split rare slow-path (top_k == ALL) from the common (top_k is small).
+        # Combine the gating reductions into ONE GPU→CPU sync so we don't pay
+        # ~50µs/sync × 6 syncs per step. k_max is unknown until we hit the
+        # fast path, so we issue a second small sync inside that branch.
         mask_all = top_ks_sel == TOP_K_ALL
         mask_topk = ~mask_all
+        _gate0 = torch.stack([mask_all.any(), mask_topk.any()]).cpu().tolist()
+        mask_all_any, mask_topk_any = _gate0
 
         # GPU fast path is active when we are doing expectation-style guidance
         # without any hard target_value/target_length constraints, and all sequences
         # use top-k (not top-k-all), so we can keep tensors on GPU.
-        has_hard_target = any(
-            _extract_target_value({"req": req_list[ridx]}) is not None
-            for ridx in range(len(req_list))
-        )
         _use_gpu_path = self._fn in (
             lvm_expectation_guidance,
             lvm_combined_guidance,
-        ) and not bool(mask_all.any().item()) and not has_hard_target
-        # Will hold (vals_send_gpu, idx_send_gpu) for the top-k send rows, on GPU.
-        _gpu_vals_chunks: List[torch.Tensor] = []
-        _gpu_idx_chunks: List[torch.Tensor] = []
+        ) and not mask_all_any and not has_hard_target
+
+        # GPU tensors for the fast-path candidates (sliced once after send_mask).
+        gpu_vals_send: Optional[torch.Tensor] = None
+        gpu_idx_send: Optional[torch.Tensor] = None
 
         # ---------------------------
         # Fast path: batched top-k -> top-p/min-p/entropy on the top-k subset.
         # ---------------------------
-        if bool(mask_topk.any().item()):
+        if mask_topk_any:
             rows_topk_t = guided_rows_t[mask_topk]
             top_ks_k = top_ks_sel[mask_topk].clamp(min=1, max=vocab_size)
             top_ps_k = top_ps_sel[mask_topk]
             min_ps_k = min_ps_sel[mask_topk]
 
-            # Single synchronization point to get k_max.
+            # Single sync to read k_max.
             k_max = int(top_ks_k.max().item())
             if k_max <= 0:
                 return None
@@ -1361,30 +1406,26 @@ class LvmGuidedSampler:
             vals = torch.where(keep_k, topk_vals, torch.zeros_like(topk_vals))
 
             # Apply per-row top-p within the (masked) top-k list.
-            # Keep token j if sum(vals[:j]) <= top_p (equivalently (cum - val) <= top_p).
-            # Note: vals are already sorted descending before masking.
-            keep_p = torch.ones_like(vals, dtype=torch.bool)
-            if torch.any(top_ps_k < 1.0):
-                cum = torch.cumsum(vals, dim=-1)
-                keep_p = (cum - vals) <= top_ps_k.view(-1, 1)
-                vals = torch.where(keep_p, vals, torch.zeros_like(vals))
+            # Idempotent when top_p == 1.0 for all rows, so we always run it
+            # instead of paying a sync to gate the branch.
+            cum = torch.cumsum(vals, dim=-1)
+            keep_p = (cum - vals) <= top_ps_k.view(-1, 1)
+            vals = torch.where(keep_p, vals, torch.zeros_like(vals))
 
             # Apply per-row min-p: keep tokens with prob >= max_prob * min_p.
-            if torch.any(min_ps_k > 0.0):
-                max_prob = vals.max(dim=-1).values
-                thresh = max_prob * min_ps_k
-                keep_min = vals >= thresh.view(-1, 1)
-                vals = torch.where(keep_min, vals, torch.zeros_like(vals))
+            # Idempotent when min_p == 0 for all rows; always run.
+            max_prob = vals.max(dim=-1, keepdim=True).values
+            thresh = max_prob * min_ps_k.view(-1, 1)
+            keep_min = vals >= thresh
+            vals = torch.where(keep_min, vals, torch.zeros_like(vals))
 
             # Ensure we always have at least one candidate (defensive, e.g. min_p > 1.0).
-            mask_nz = vals > 0
-            counts = mask_nz.sum(dim=-1)
-            if torch.any(counts == 0):
-                zero_rows = counts == 0
-                vals = vals.clone()
-                vals[zero_rows, 0] = topk_vals[zero_rows, 0]
-                mask_nz = vals > 0
-                counts = mask_nz.sum(dim=-1)
+            # Replace col-0 of zero rows with topk_vals[:, 0] in one batched where().
+            counts = (vals > 0).sum(dim=-1)
+            zero_rows = (counts == 0).view(-1, 1)
+            col0_mask = (ar == 0)  # [1, K_max]
+            vals = torch.where(zero_rows & col0_mask, topk_vals, vals)
+            counts = (vals > 0).sum(dim=-1)  # recompute after fixup
 
             # Deterministic rows: exactly 1 candidate.
             det_mask = counts == 1
@@ -1394,82 +1435,114 @@ class LvmGuidedSampler:
             ).view(-1)
 
             # Optional entropy-based skip (per request, Python-sourced thresholds).
-            rows_topk_list: List[int] = rows_topk_t.detach().cpu().tolist()
+            # The per-row thresholds need to come from req.custom_params, so we do
+            # need one row-index transfer here. Cached on req → constant-time lookup.
+            rows_topk_list: List[int] = rows_topk_t.tolist()
             thr_list: List[float] = []
-            has_thr = torch.zeros(len(rows_topk_list), device=device, dtype=torch.bool)
-            for j, ridx in enumerate(rows_topk_list):
+            has_thr_flags: List[bool] = []
+            any_thr = False
+            for ridx in rows_topk_list:
                 thr = self._extract_entropy_threshold(req_list[ridx])
                 if thr is None:
                     thr_list.append(float("nan"))
+                    has_thr_flags.append(False)
                 else:
                     thr_list.append(float(thr))
-                    has_thr[j] = True
+                    has_thr_flags.append(True)
+                    any_thr = True
 
-            # Use float64 for value-guidance gating to avoid precision loss in entropy comparisons.
-            thr_t = torch.tensor(thr_list, device=device, dtype=torch.float64)
-            skip_entropy = torch.zeros_like(has_thr, dtype=torch.bool)
-            if bool(has_thr.any().item()):
+            if any_thr:
+                has_thr_t = torch.tensor(has_thr_flags, device=device, dtype=torch.bool)
+                thr_t = torch.tensor(thr_list, device=device, dtype=torch.float64)
                 p = vals.to(torch.float64)
                 s = p.sum(dim=-1)
-                # Avoid division by 0; counts==0 already fixed.
                 p = p / s.clamp(min=1e-20).view(-1, 1)
                 ent = -(p * torch.log(p + 1e-20)).sum(dim=-1)
-                skip_entropy = has_thr & (ent <= thr_t)
+                skip_entropy = has_thr_t & (ent <= thr_t)
+            else:
+                skip_entropy = torch.zeros_like(det_mask)
 
             # Rows to send to LVM: non-deterministic and not skipped by entropy.
             send_mask = (~det_mask) & (~skip_entropy)
 
-            # Materialize deterministic rows in Python list.
-            if bool(det_mask.any().item()):
-                det_token_ids_cpu = det_token_ids.detach().cpu().tolist()
-                det_mask_cpu = det_mask.detach().cpu().tolist()
-                for j, is_det in enumerate(det_mask_cpu):
-                    if is_det:
-                        deterministic_rows.append((rows_topk_list[j], int(det_token_ids_cpu[j])))
+            # Slice GPU tensors by masks (still on GPU, no transfer yet).
+            rows_send_gpu = rows_topk_t[send_mask]
+            vals_send_gpu = vals[send_mask]      # [B_send, k_max], filtered
+            idx_send_gpu = topk_idx[send_mask]   # [B_send, k_max]
+            n_valid_send_gpu = counts[send_mask]
+            det_rows_gpu = rows_topk_t[det_mask]
+            det_tok_gpu = det_token_ids[det_mask]
 
-            # Prepare candidate lists for rows that we will actually send.
-            if bool(send_mask.any().item()):
-                rows_send_t = rows_topk_t[send_mask]
-                # Keep GPU slices before moving to CPU (used by GPU guidance fast path).
-                vals_send_gpu = vals[send_mask]  # [B_topk_send, K_max], GPU
-                idx_send_gpu = topk_idx[send_mask]  # [B_topk_send, K_max], GPU
-                idx_send = idx_send_gpu.detach().cpu()
-                # GPU fast path: only need bool mask (4x smaller than float32 transfer).
-                # CPU path: need full float values for candidate_probs_send.
+            # Single bulk pull of everything host-side from now on. This is the
+            # only sync inside the fast path (modulo k_max above and gate0 earlier).
+            rows_send_cpu = rows_send_gpu.tolist()
+            n_valid_send_cpu = n_valid_send_gpu.tolist()
+            det_rows_cpu = det_rows_gpu.tolist()
+            det_tok_cpu = det_tok_gpu.tolist()
+
+            deterministic_rows_idx.extend(det_rows_cpu)
+            deterministic_rows_tok.extend(det_tok_cpu)
+
+            if rows_send_cpu:
+                idx_send_cpu = idx_send_gpu.tolist()
+                # Track which send rows we actually kept (after the n<2 safety
+                # fallback) so the GPU candidates tensor stays row-aligned.
+                kept_send_mask: Optional[List[bool]] = None
                 if _use_gpu_path:
-                    valid_mask_send = (vals_send_gpu > 0).detach().cpu()
+                    kept_send_mask = []
+                    for j, ridx in enumerate(rows_send_cpu):
+                        # Valid positions are a contiguous prefix because the
+                        # sort is descending and every filter (top-k / top-p /
+                        # min-p) only zeroes out a suffix.
+                        n = n_valid_send_cpu[j]
+                        cand_ids = idx_send_cpu[j][:n]
+                        if n < 2:
+                            # Defensive: send_mask is supposed to exclude these
+                            # (counts != 1 and the col-0 fixup keeps counts >= 1),
+                            # but a degenerate all-zero prob row would slip
+                            # through with n == 0.
+                            if n == 1:
+                                deterministic_rows_idx.append(ridx)
+                                deterministic_rows_tok.append(int(cand_ids[0]))
+                            kept_send_mask.append(False)
+                            continue
+                        prefix = self._get_prefix_ids_incremental(req_list[ridx])
+                        prefix_ids_send.append(prefix)
+                        candidate_ids_send.append(cand_ids)
+                        send_batch_indices.append(ridx)
+                        kept_send_mask.append(True)
+                    if all(kept_send_mask):
+                        # Common case: every send row stayed. Use the sliced
+                        # GPU tensors directly.
+                        gpu_vals_send = vals_send_gpu.float()
+                        gpu_idx_send = idx_send_gpu
+                    elif any(kept_send_mask):
+                        # Rare: some rows were demoted to deterministic above.
+                        # Filter the GPU rows to match.
+                        keep_t = torch.tensor(kept_send_mask, device=device, dtype=torch.bool)
+                        gpu_vals_send = vals_send_gpu[keep_t].float()
+                        gpu_idx_send = idx_send_gpu[keep_t]
                 else:
-                    vals_send = vals_send_gpu.detach().cpu()
-
-                rows_send_list = rows_send_t.detach().cpu().tolist()
-                for j, ridx in enumerate(rows_send_list):
-                    # In practice (sorted desc + thresholding), non-zeros are a prefix. Still, use mask for safety.
-                    if _use_gpu_path:
-                        m = valid_mask_send[j]
-                    else:
-                        m = vals_send[j] > 0
-                    cand_ids = idx_send[j][m].tolist()
-                    if len(cand_ids) <= 1:
-                        # Should have been caught by det_mask, but keep a safe fallback.
-                        if len(cand_ids) == 1:
-                            deterministic_rows.append((ridx, int(cand_ids[0])))
-                        continue
-
-                    prefix = self._get_prefix_ids_incremental(req_list[ridx])
-                    prefix_ids_send.append(prefix)
-                    candidate_ids_send.append(cand_ids)
-                    if not _use_gpu_path:
-                        candidate_probs_send.append(vals_send[j][m].tolist())
-                    send_batch_indices.append(ridx)
-                    if _use_gpu_path:
-                        # Capture GPU row j for later gpu_candidates assembly.
-                        _gpu_vals_chunks.append(vals_send_gpu[j].unsqueeze(0))
-                        _gpu_idx_chunks.append(idx_send_gpu[j].unsqueeze(0))
+                    vals_send_cpu = vals_send_gpu.tolist()
+                    for j, ridx in enumerate(rows_send_cpu):
+                        n = n_valid_send_cpu[j]
+                        cand_ids = idx_send_cpu[j][:n]
+                        cand_probs = vals_send_cpu[j][:n]
+                        if n < 2:
+                            if n == 1:
+                                deterministic_rows_idx.append(ridx)
+                                deterministic_rows_tok.append(int(cand_ids[0]))
+                            continue
+                        prefix = self._get_prefix_ids_incremental(req_list[ridx])
+                        prefix_ids_send.append(prefix)
+                        candidate_ids_send.append(cand_ids)
+                        candidate_probs_send.append(cand_probs)
+                        send_batch_indices.append(ridx)
 
         # ---------------------------
         # Slow path: top_k == ALL (full vocab filtering). Rare; keep correctness-oriented CPU behavior.
         # ---------------------------
-        if bool(mask_all.any().item()):
+        if mask_all_any:
             rows_all_list = guided_rows_t[mask_all].detach().cpu().tolist()
             top_ps_all = top_ps_sel[mask_all].detach().cpu().tolist()
             min_ps_all = min_ps_sel[mask_all].detach().cpu().tolist()
@@ -1488,7 +1561,8 @@ class LvmGuidedSampler:
                 cand_probs = filtered[cand_idx].tolist()
 
                 if len(cand_idx) == 1:
-                    deterministic_rows.append((i, int(cand_idx[0])))
+                    deterministic_rows_idx.append(i)
+                    deterministic_rows_tok.append(int(cand_idx[0]))
                     continue
 
                 thr = self._extract_entropy_threshold(req_list[i])
@@ -1510,24 +1584,22 @@ class LvmGuidedSampler:
                 candidate_probs_send.append(cand_probs)
                 send_batch_indices.append(i)
 
-        if not send_batch_indices and not deterministic_rows:
+        if not send_batch_indices and not deterministic_rows_idx:
             return None
 
-        # Build guided tensor and fill deterministic rows immediately.
+        # Build guided tensor and fill deterministic rows in batched form.
         guided = probs.clone()
-
-        # Fill deterministic rows (single candidate) without contacting LVM.
-        for i, tok in deterministic_rows:
-            guided[i].zero_()
-            guided[i, tok] = 1.0
+        if deterministic_rows_idx:
+            det_rows_t = torch.tensor(deterministic_rows_idx, device=device, dtype=torch.long)
+            det_toks_t = torch.tensor(deterministic_rows_tok, device=device, dtype=torch.long)
+            guided.index_fill_(0, det_rows_t, 0.0)
+            guided[det_rows_t, det_toks_t] = 1.0
 
         # Assemble GPU candidate tensors for the fast guidance path.
         gpu_candidates = None
-        if _use_gpu_path and _gpu_vals_chunks:
-            gp = torch.cat(_gpu_vals_chunks, dim=0).float()  # [B_send, K_max]
-            gi = torch.cat(_gpu_idx_chunks, dim=0)  # [B_send, K_max]
-            gm = gp > 0  # [B_send, K_max] bool
-            gpu_candidates = (gp, gi, gm)
+        if _use_gpu_path and gpu_vals_send is not None:
+            gpu_valid_mask = gpu_vals_send > 0
+            gpu_candidates = (gpu_vals_send, gpu_idx_send, gpu_valid_mask)
 
         return PendingLvmResult(
             req_list=req_list,
