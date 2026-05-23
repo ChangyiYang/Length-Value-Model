@@ -150,6 +150,14 @@ ssh changyi@liquid-gpu-055 'cd Length-Value-Model && \
   bash scripts/_run_correctness_build_pending.sh
 ```
 
+### Tradeoff sweep correctness (2026-05-23)
+
+Stronger correctness check on top of pass@k: re-ran the `demo_tradeoff.sh` flow against 7B base + 1.5B math LenVM (the only LenVM checkpoint on this host), **once on patched code (`b6198eb`) and once on baseline-code (`lenvm-timing-analysis@799025a`) in the same session**, then 3-way diffed against the user-supplied reference table. Driver: `scripts/_run_correctness_tradeoff_7b.sh`; diff: `scripts/_diff_tradeoff_results.py`.
+
+- **Baseline path (`top_k=-1`, no LenVM custom_params, `_build_pending` bypassed)**: P-B delta is purely run-to-run sampling noise → max pass@1 Δ +0.044, avg_length Δ -7 tokens.
+- **centered_exp path (`top_k=5`, LenVM custom_params, `_build_pending` exercised)** across 5 scales (-100,-10,-5,-2,0): all P-B pass@1 Δ within ±0.015 (max abs 0.015 at scale=0), all avg_length Δ within ±6 tokens (max 5.9). **Every centered_exp delta is smaller than the bypass-path noise floor**, so patched and baseline-code are algorithmically equivalent up to sampling noise on the exercised code path.
+- Both new runs (bcode + patched) sit ~9-10% above the user reference for pass@1; bcode's gap to ref ≈ patched's gap to ref → drift is from codebase evolution since the reference table was generated, not from this patch.
+
 ### Known correctness-gate gap
 
 `inference/tradeoff/sample_eval.py` does not forward `seed` to the SGLang server, so the §1 **strict bitwise** gate cannot run yet — pass@k stability is the only available gate for this PR. Threading `seed` through `sample_eval` (and through `run_timing`) is a separate small PR; track it in `out-of-scope` below if it's not started before the next perf change.
