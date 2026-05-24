@@ -250,8 +250,8 @@ def build_tree_value_custom_mask_and_positions(
         # Candidate rows: attend all prefix tokens (0..L-1) and itself.
         cand_row_start = L - P
         m[cand_row_start : cand_row_start + N, :L] = True
-        for j in range(N):
-            m[cand_row_start + j, L + j] = True
+        cand_arange = np.arange(N)
+        m[cand_row_start + cand_arange, L + cand_arange] = True
 
         mask_off += q_len * k_len
 
