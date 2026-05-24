@@ -794,6 +794,10 @@ class PendingLvmResult:
     prefix_ids_send: List[List[int]]
     candidate_ids_send: List[List[int]]
     candidate_probs_send: List[List[float]]
+    # Candidate lengths for the GPU fast path. Lets the in-process runner skip
+    # rebuilding per-row sizes from candidate_ids_send when it has gpu_candidates
+    # available. (Sourced from upstream PR #3.)
+    candidate_lens_send: Optional[List[int]] = None
     # GPU tensors for the fast path (only set when the guidance function can use the
     # expectation-guidance GPU path and all send indices come from the top-k path,
     # not top-k-all).
@@ -1060,7 +1064,11 @@ class LvmGuidedSampler:
                 return out
 
             def tree_value_launch_gpu(
-                self, rids: List[str], candidate_ids: List[List[int]], gpu_candidates: Optional[tuple] = None
+                self,
+                rids: List[str],
+                candidate_ids: List[List[int]],
+                gpu_candidates: Optional[tuple] = None,
+                candidate_lens: Optional[List[int]] = None,
             ):
                 """Like tree_value_launch() but keeps embeddings on GPU (no PCIe copy)."""
                 self.lvm_stream.wait_stream(torch.cuda.current_stream())
@@ -1070,12 +1078,74 @@ class LvmGuidedSampler:
                         rids,
                         candidate_ids,
                         gpu_candidates=gpu_candidates,
+                        candidate_lens_per_req=candidate_lens,
                         mrope_deltas=self._mrope_deltas if self.is_vlm else None,
                     )
                     # embeddings stay on GPU — no PCIe copy.
                     self.embed_ready.record(self.lvm_stream)
-                
+
                 return embeddings  # GPU tensor(s), not yet safe from default stream
+
+            def tree_value_extend_and_launch_gpu(
+                self,
+                rids: List[str],
+                prefix_ids: List[List[int]],
+                reqs: List[Req],
+                candidate_ids: List[List[int]],
+                gpu_candidates: Optional[tuple] = None,
+                candidate_lens: Optional[List[int]] = None,
+            ):
+                """Cherry-picked from upstream PR #3: fuse the tiny prefix extend
+                and the candidate scoring into one LVM forward.
+
+                Returns None when fusion is not applicable (VLM, page_size != 1,
+                or any prefix delta > 1 token); callers fall back to the two-phase
+                tree_value_extend + tree_value_launch_gpu path.
+                """
+                if self.is_vlm:
+                    return None
+                if (
+                    getattr(
+                        self.incremental_runner.runner.token_to_kv_pool_allocator,
+                        "page_size",
+                        1,
+                    )
+                    != 1
+                ):
+                    return None
+
+                # Inspect prefix deltas vs LVM-cached prefix lengths; abort fusion
+                # if any request needs more than a single new token this step.
+                new_tokens_list: List[List[int]] = []
+                for rid, p_ids in zip(rids, prefix_ids):
+                    cached_len = self.incremental_runner.kv_mgr.kv_len(rid)
+                    target_len = len(p_ids)
+                    if target_len < cached_len:
+                        self.incremental_runner.kv_mgr.retract(rid, target_len)
+                        cached_len = target_len
+
+                    if target_len > cached_len:
+                        new_tokens = p_ids[cached_len:]
+                    else:
+                        new_tokens = []
+                    if len(new_tokens) > 1:
+                        return None
+                    new_tokens_list.append(new_tokens)
+
+                self.lvm_stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(self.lvm_stream):
+                    embeddings = (
+                        self.incremental_runner.extend_and_eval_candidates_batch_gpu(
+                            rids,
+                            new_tokens_list,
+                            candidate_ids,
+                            gpu_candidates=gpu_candidates,
+                            candidate_lens_per_req=candidate_lens,
+                        )
+                    )
+                    self.embed_ready.record(self.lvm_stream)
+
+                return embeddings
 
             def tree_value_collect_gpu(self, gpu_embeddings):
                 """Insert a stream dependency so the default stream waits for lvm_stream."""
@@ -1430,6 +1500,9 @@ class LvmGuidedSampler:
         candidate_ids_send: List[List[int]] = []
         send_batch_indices: List[int] = []
         candidate_probs_send: List[List[float]] = []
+        # Per-send-row valid candidate count, threaded down so the in-process
+        # runner / fused path doesn't have to walk candidate_ids_send again.
+        candidate_lens_send: List[int] = []
         deterministic_rows_idx: List[int] = []
         deterministic_rows_tok: List[int] = []
 
@@ -1580,6 +1653,7 @@ class LvmGuidedSampler:
                         prefix = self._get_prefix_ids_incremental(req_list[ridx])
                         prefix_ids_send.append(prefix)
                         candidate_ids_send.append(cand_ids)
+                        candidate_lens_send.append(n)
                         send_batch_indices.append(ridx)
                         kept_send_mask.append(True)
                     if all(kept_send_mask):
@@ -1608,6 +1682,7 @@ class LvmGuidedSampler:
                         prefix_ids_send.append(prefix)
                         candidate_ids_send.append(cand_ids)
                         candidate_probs_send.append(cand_probs)
+                        candidate_lens_send.append(n)
                         send_batch_indices.append(ridx)
 
         # ---------------------------
@@ -1653,6 +1728,7 @@ class LvmGuidedSampler:
                 prefix_ids_send.append(prefix)
                 candidate_ids_send.append(cand_idx)
                 candidate_probs_send.append(cand_probs)
+                candidate_lens_send.append(len(cand_idx))
                 send_batch_indices.append(i)
 
         if not send_batch_indices and not deterministic_rows_idx:
@@ -1680,6 +1756,7 @@ class LvmGuidedSampler:
             prefix_ids_send=prefix_ids_send,
             candidate_ids_send=candidate_ids_send,
             candidate_probs_send=candidate_probs_send,
+            candidate_lens_send=candidate_lens_send or None,
             gpu_candidates=gpu_candidates,
         )
 
@@ -1925,17 +2002,36 @@ class LvmGuidedSampler:
             reqs_send = [pending.req_list[i] for i in pending.send_batch_indices]
             timer.set_meta(lvm_n_reqs_with_guidance=len(reqs_send))
             if pending.gpu_candidates is not None:
-                # GPU fast path (synchronous).
+                # GPU fast path (synchronous). Try the fused
+                # extend+candidate kernel from upstream PR #3 first; fall back
+                # to the two-phase path when fusion isn't applicable (VLM,
+                # page_size != 1, or any prefix delta > 1 token).
                 if inproc not in (None, False):
                     try:
                         rids_send = [req.rid for req in reqs_send]
                         t_fwd = timer.section_start("t_lvm_forward_ms")
-                        inproc.tree_value_extend(rids_send, pending.prefix_ids_send, reqs_send)
-                        gpu_emb = inproc.tree_value_launch_gpu(
-                            rids_send, pending.candidate_ids_send, gpu_candidates=pending.gpu_candidates
+                        gpu_emb = inproc.tree_value_extend_and_launch_gpu(
+                            rids_send,
+                            pending.prefix_ids_send,
+                            reqs_send,
+                            pending.candidate_ids_send,
+                            gpu_candidates=pending.gpu_candidates,
+                            candidate_lens=pending.candidate_lens_send,
                         )
+                        fused = gpu_emb is not None
+                        if not fused:
+                            inproc.tree_value_extend(
+                                rids_send, pending.prefix_ids_send, reqs_send
+                            )
+                            gpu_emb = inproc.tree_value_launch_gpu(
+                                rids_send,
+                                pending.candidate_ids_send,
+                                gpu_candidates=pending.gpu_candidates,
+                                candidate_lens=pending.candidate_lens_send,
+                            )
                         gpu_embeddings = inproc.tree_value_collect_gpu(gpu_emb)
                         timer.section_end("t_lvm_forward_ms", t_fwd)
+                        timer.set_meta(lvm_fused_path=int(fused))
                         t_ag = timer.section_start("t_lvm_apply_guidance_ms")
                         self._apply_guidance_gpu(pending, gpu_embeddings)
                         timer.section_end("t_lvm_apply_guidance_ms", t_ag)

@@ -317,12 +317,17 @@ class LvmInprocRunner:
         rids: List[str],
         candidate_ids_per_req: List[List[int]],
         gpu_candidates: Optional[tuple] = None,
+        candidate_lens_per_req: Optional[List[int]] = None,
         mrope_deltas: Optional[dict] = None,
     ) -> List[torch.Tensor]:
         """Evaluate candidates with tree attention and return raw GPU embeddings.
 
         mrope_deltas: optional rid -> mrope_position_delta mapping used by the
         VLM path to build 3D M-RoPE positions for candidate tokens.
+
+        candidate_lens_per_req: optional precomputed lengths so the GPU fast
+        path can skip rebuilding Python lists from candidate_ids_per_req.
+        (Sourced from upstream PR #3.)
 
         This enables the fast-path where LenVM mathematical guidance runs entirely
         on the GPU without downloading tensors to the CPU.
@@ -334,7 +339,19 @@ class LvmInprocRunner:
         device = self.device
 
         prefix_lens = [self.kv_mgr.kv_len(rid) for rid in rids]
-        cand_lens = [len(cands) for cands in candidate_ids_per_req]
+        if candidate_lens_per_req is None:
+            cand_lens = [len(cands) for cands in candidate_ids_per_req]
+        else:
+            cand_lens = [int(n) for n in candidate_lens_per_req]
+            if len(cand_lens) != len(rids):
+                raise RuntimeError(
+                    "candidate_lens_per_req length must match rids length: "
+                    f"{len(cand_lens)} vs {len(rids)}"
+                )
+            if any(n <= 0 for n in cand_lens):
+                raise RuntimeError(
+                    f"candidate lengths must be positive, got {cand_lens!r}"
+                )
         seq_lens_list = [prefix_lens[i] + cand_lens[i] for i in range(len(rids))]
         total_cands = sum(cand_lens)
         pool_indices = [self.kv_mgr.pool_indices[rid] for rid in rids]
@@ -375,6 +392,11 @@ class LvmInprocRunner:
         if gpu_candidates is not None:
             _, gi, gm = gpu_candidates
             input_ids_t = gi[gm].to(torch.int64)
+            if int(input_ids_t.numel()) != total_cands:
+                raise RuntimeError(
+                    "GPU candidate mask does not match candidate lengths: "
+                    f"mask_tokens={int(input_ids_t.numel())} total_cands={total_cands}"
+                )
         else:
             input_ids_t = torch.tensor(
                 [t for cands in candidate_ids_per_req for t in cands],
@@ -453,6 +475,216 @@ class LvmInprocRunner:
         finally:
             # Free candidate KV slots immediately (they must not be cached).
             runner.token_to_kv_pool_allocator.free(out_cache_loc)
+
+        return logits_output.embeddings
+
+    def extend_and_eval_candidates_batch_gpu(
+        self,
+        rids: List[str],
+        new_tokens_per_req: List[List[int]],
+        candidate_ids_per_req: List[List[int]],
+        gpu_candidates: Optional[tuple] = None,
+        candidate_lens_per_req: Optional[List[int]] = None,
+    ) -> List[torch.Tensor]:
+        """Fuse a tiny prefix extend + candidate scoring into ONE LVM forward.
+
+        Cherry-picked from upstream PR #3 (namezhenzhang). In steady-state decode
+        each request adds at most one accepted token per step, so the prefix
+        extend Q_len is 1 and we can combine it with the k candidate tokens
+        into a single forward (Q_len = 1 + k) with the right tree mask.
+
+        Returns None when fusion is not applicable so callers can fall back to
+        the two-phase path:
+          - VLM model path (extra mrope plumbing not yet wired through fused)
+          - allocator page_size != 1 (token-granular alloc required)
+          - any request needs to extend more than 1 prefix token this step
+        """
+        if not rids:
+            return []
+        if len(new_tokens_per_req) != len(rids):
+            raise RuntimeError(
+                "new_tokens_per_req length must match rids length: "
+                f"{len(new_tokens_per_req)} vs {len(rids)}"
+            )
+
+        runner = self.runner
+        device = self.device
+
+        cached_prefix_lens = [self.kv_mgr.kv_len(rid) for rid in rids]
+        extend_lens = [len(toks) for toks in new_tokens_per_req]
+        if any(n > 1 for n in extend_lens):
+            return None
+
+        if candidate_lens_per_req is None:
+            cand_lens = [len(cands) for cands in candidate_ids_per_req]
+        else:
+            cand_lens = [int(n) for n in candidate_lens_per_req]
+            if len(cand_lens) != len(rids):
+                raise RuntimeError(
+                    "candidate_lens_per_req length must match rids length: "
+                    f"{len(cand_lens)} vs {len(rids)}"
+                )
+            if any(n <= 0 for n in cand_lens):
+                raise RuntimeError(
+                    f"candidate lengths must be positive, got {cand_lens!r}"
+                )
+
+        prefix_lens = [
+            cached_prefix_lens[i] + extend_lens[i] for i in range(len(rids))
+        ]
+        extend_seq_lens = [
+            extend_lens[i] + cand_lens[i] for i in range(len(rids))
+        ]
+        seq_lens_list = [
+            prefix_lens[i] + cand_lens[i] for i in range(len(rids))
+        ]
+        total_extend = sum(extend_seq_lens)
+        total_cands = sum(cand_lens)
+        pool_indices = [self.kv_mgr.get_or_alloc(rid) for rid in rids]
+
+        allocator = runner.token_to_kv_pool_allocator
+        if getattr(allocator, "page_size", 1) != 1:
+            return None
+        out_cache_loc = allocator.alloc(total_extend)
+        if out_cache_loc is None:
+            raise RuntimeError(
+                f"LVM KV pool OOM: cannot allocate {total_extend} fused slots. "
+                "Consider --lvm-guided-inproc-mem-fraction-static."
+            )
+        out_cache_loc = out_cache_loc.to(torch.int64)
+
+        # Write KV slots into the pool: extend tokens then candidate tokens for each req.
+        candidate_cache_chunks = []
+        pt = 0
+        for pool_idx, cached_len, e_len, n in zip(
+            pool_indices, cached_prefix_lens, extend_lens, cand_lens
+        ):
+            seq_tokens = e_len + n
+            runner.req_to_token_pool.write(
+                (pool_idx, slice(cached_len, cached_len + seq_tokens)),
+                out_cache_loc[pt : pt + seq_tokens],
+            )
+            if n > 0:
+                candidate_cache_chunks.append(
+                    out_cache_loc[pt + e_len : pt + seq_tokens]
+                )
+            pt += seq_tokens
+
+        # Build input_ids: interleave (extend_token, candidate_tokens) per req.
+        if gpu_candidates is not None:
+            _, gi, gm = gpu_candidates
+            has_new_list = [len(toks) > 0 for toks in new_tokens_per_req]
+            if any(has_new_list):
+                new_ids_t = torch.tensor(
+                    [int(toks[0]) if toks else 0 for toks in new_tokens_per_req],
+                    dtype=torch.int64,
+                    device=device,
+                )
+                has_new_t = torch.tensor(
+                    has_new_list, dtype=torch.bool, device=device
+                )
+                B, K = gi.shape
+                padded_input_ids = torch.empty(
+                    (B, K + 1), dtype=torch.int64, device=device
+                )
+                padded_input_ids[:, 0] = new_ids_t
+                padded_input_ids[:, 1:] = gi
+                padded_mask = torch.empty((B, K + 1), dtype=torch.bool, device=device)
+                padded_mask[:, 0] = has_new_t
+                padded_mask[:, 1:] = gm
+                input_ids_t = padded_input_ids[padded_mask]
+            else:
+                input_ids_t = gi[gm].to(torch.int64)
+        else:
+            input_ids_list: List[int] = []
+            for toks, cands in zip(new_tokens_per_req, candidate_ids_per_req):
+                input_ids_list.extend(int(t) for t in toks)
+                input_ids_list.extend(int(t) for t in cands)
+            input_ids_t = torch.tensor(input_ids_list, dtype=torch.int64, device=device)
+        if int(input_ids_t.numel()) != total_extend:
+            raise RuntimeError(
+                "fused LenVM input length does not match metadata: "
+                f"input_tokens={int(input_ids_t.numel())} total_extend={total_extend}"
+            )
+
+        req_pool_indices_t = torch.tensor(pool_indices, dtype=torch.int64, device=device)
+        seq_lens_t = torch.tensor(seq_lens_list, dtype=torch.int32, device=device)
+        seq_lens_cpu_t = torch.tensor(seq_lens_list, dtype=torch.int32)
+        extend_prefix_lens_t = torch.tensor(
+            cached_prefix_lens, dtype=torch.int32, device=device
+        )
+        extend_seq_lens_t = torch.tensor(
+            extend_seq_lens, dtype=torch.int32, device=device
+        )
+
+        custom_mask, positions = build_tree_value_custom_mask_and_positions(
+            prefix_lens=prefix_lens,
+            candidate_lens=cand_lens,
+            cached_prefix_lens=cached_prefix_lens,
+            device=device,
+        )
+        spec_info = TreeValueSpecInput(
+            custom_mask=custom_mask,
+            positions=positions,
+            tree_value_prefix_lens=list(prefix_lens),
+            tree_value_candidate_lens=list(cand_lens),
+            tree_value_cached_prefix_lens=list(cached_prefix_lens),
+        )
+
+        extend_start_loc = torch.zeros(len(rids), dtype=torch.int32, device=device)
+        if len(rids) > 1:
+            extend_start_loc[1:] = torch.cumsum(extend_seq_lens_t[:-1], dim=0)
+
+        forward_batch = ForwardBatch(
+            forward_mode=ForwardMode.EXTEND,
+            batch_size=len(rids),
+            input_ids=input_ids_t,
+            req_pool_indices=req_pool_indices_t,
+            seq_lens=seq_lens_t,
+            seq_lens_cpu=seq_lens_cpu_t,
+            out_cache_loc=out_cache_loc,
+            seq_lens_sum=sum(seq_lens_list),
+            positions=positions,
+            extend_num_tokens=total_extend,
+            extend_seq_lens=extend_seq_lens_t,
+            extend_prefix_lens=extend_prefix_lens_t,
+            extend_start_loc=extend_start_loc,
+            extend_prefix_lens_cpu=list(cached_prefix_lens),
+            extend_seq_lens_cpu=list(extend_seq_lens),
+            req_to_token_pool=runner.req_to_token_pool,
+            token_to_kv_pool=runner.token_to_kv_pool,
+            attn_backend=runner.attn_backend,
+            return_logprob=False,
+            is_extend_in_batch=True,
+            is_prefill_only=True,
+            spec_algorithm=SpeculativeAlgorithm.NONE,
+            spec_info=spec_info,
+            global_forward_mode=ForwardMode.EXTEND,
+        )
+        forward_batch.num_token_non_padded_cpu = total_extend
+
+        candidate_cache_loc = (
+            torch.cat(candidate_cache_chunks, dim=0)
+            if candidate_cache_chunks
+            else out_cache_loc[:0]
+        )
+
+        success = False
+        try:
+            with self._lvm_embedding_cache_ctx():
+                logits_output = runner.forward_extend(forward_batch)
+            success = True
+        finally:
+            if success:
+                # Keep prefix KV in pool, free only candidate slots.
+                runner.token_to_kv_pool_allocator.free(candidate_cache_loc)
+            else:
+                # Failure: free everything we just allocated.
+                runner.token_to_kv_pool_allocator.free(out_cache_loc)
+
+        # Account for the prefix tokens we just committed to KV cache.
+        for rid, e_len in zip(rids, extend_lens):
+            self.kv_mgr.kv_lens[rid] += e_len
 
         return logits_output.embeddings
 
