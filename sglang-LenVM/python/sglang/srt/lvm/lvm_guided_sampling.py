@@ -115,6 +115,38 @@ def _extract_value_mode(kwargs: dict, default: str = "mul") -> str:
     return mode
 
 
+def _get_req_value_mode_and_scale(req: Any) -> tuple[str, float]:
+    """Return cached expectation-guidance (mode, scale) for a request.
+
+    Per-req cache keyed on custom_params identity + mode/scale entries so a
+    legitimate in-flight update (rare) invalidates correctly. Sourced from
+    upstream PR #3 (namezhenzhang), needed by the neutral-scale precheck.
+    """
+    custom_params = _get_req_custom_params(req)
+    cache_key = (
+        id(custom_params),
+        custom_params.get("mode"),
+        custom_params.get("value_mode"),
+        custom_params.get("scale"),
+        custom_params.get("value_scale"),
+    )
+    cached = getattr(req, "_lvm_value_mode_scale_cache", None)
+    if (
+        isinstance(cached, tuple)
+        and len(cached) == 3
+        and cached[0] == cache_key
+    ):
+        return cached[1], cached[2]
+
+    mode = _extract_value_mode({"req": req}, default="mul")
+    scale = _extract_value_scale({"req": req}, default=1.0)
+    try:
+        setattr(req, "_lvm_value_mode_scale_cache", (cache_key, mode, scale))
+    except Exception:
+        pass
+    return mode, scale
+
+
 def _extract_length_gamma(kwargs: dict, default: float = 0.997) -> float:
     """Extract gamma used for value->length mapping.
 
@@ -1148,10 +1180,15 @@ class LvmGuidedSampler:
 
     @staticmethod
     def _req_wants_value_guidance(req: Any) -> bool:
-        """Return True iff the request explicitly specifies value-guidance params.
+        """Return True iff the request explicitly specifies value-guidance params
+        AND that configuration is not a no-op tilt.
 
-        We gate tree_value calls on this to avoid unnecessary network overhead when
-        the user did not request value guidance (default scale/mode).
+        Cherry-picked from upstream PR #3 (namezhenzhang): when the requested
+        (mode, scale) is mathematically equivalent to vanilla sampling — e.g.
+        `centered_exp` with scale=0 makes `exp(0 * value) == 1` for all
+        candidates — we return False so the entire LVM forward is skipped.
+        Saves the full ~60 s LVM cost at the paper's neutral config without
+        changing token-selection behavior.
         """
         cached = getattr(req, "_lvm_wants_guidance", None)
         if cached is not None:
@@ -1177,7 +1214,41 @@ class LvmGuidedSampler:
             "cmp",
             "op",
         )
-        result = any(k in custom_params for k in keys)
+        if not any(k in custom_params for k in keys):
+            result = False
+        else:
+            # Hard-constraint requests always need LVM (target_* drives selection).
+            hard_constraint_keys = (
+                "target_value",
+                "target_length",
+                "value_constraint",
+                "constraint",
+                "cmp",
+                "op",
+            )
+            if any(k in custom_params for k in hard_constraint_keys):
+                result = True
+            else:
+                # Expectation guidance: detect no-op (mode, scale) combinations.
+                try:
+                    mode, scale = _get_req_value_mode_and_scale(req)
+                except ValueError:
+                    # Surface invalid params at guidance time, not by silent skip.
+                    result = True
+                else:
+                    if mode in ("centered_exp", "value_bias"):
+                        # exp(scale * value) == 1 for all candidates when scale == 0.
+                        result = not math.isclose(
+                            scale, 0.0, rel_tol=0.0, abs_tol=1e-12
+                        )
+                    elif mode == "mul" and scale <= 0.0:
+                        # Original expectation_guidance returns probs unchanged for scale<=0.
+                        result = False
+                    else:
+                        # mul/exp/linear/length_mul: scale==1 keeps cur_exp unchanged.
+                        result = not math.isclose(
+                            scale, 1.0, rel_tol=0.0, abs_tol=1e-12
+                        )
         try:
             setattr(req, "_lvm_wants_guidance", result)
         except Exception:
